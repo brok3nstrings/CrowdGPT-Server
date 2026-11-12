@@ -902,6 +902,7 @@ def _gpu_arch_class(gpu_name: str) -> str:
     if any(x in g for x in ("2080","2070","2060","rtx 20","t4","titan rtx","quadro rtx")): return "turing"
     if any(x in g for x in ("1080","1070","1060","1050","titan x","titan v")): return "pascal"
     if "v100" in g: return "volta"
+    if "arc" in g: return "intel_arc"
     if any(x in g for x in ("radeon","mi250","mi300","mi210","mi100")): return "rocm"
     return "unknown"
 
@@ -954,9 +955,11 @@ def _pools_compatible(client_sig: tuple, pool_sig: tuple) -> bool:
       * BF16 pool: accepts only bf16-native clients.
       * Other / any: require exact autocast match.
 
-    Arch is intentionally ignored (cross-arch tolerated at 5× threshold)."""
-    if len(client_sig) < 4 or len(pool_sig) < 4: return False
+    Hardware architecture must match so clients from different compute families
+    never share a pool."""
+    if len(client_sig) < 5 or len(pool_sig) < 5: return False
     if client_sig[0] != pool_sig[0]: return False  # backend exact
+    if client_sig[4] != pool_sig[4]: return False  # architecture exact
 
     def _norm_opt(s):
         s = str(s or "any").lower()
@@ -1811,8 +1814,12 @@ def update_and_save_status(push_hf: bool = True):
             gpu_arch = sig[4]
             key = f"{backend}-{autocast}-{gpu_arch}"
             if key not in pool_breakdown:
-                pool_breakdown[key] = {"forming": 0, "training": 0, "ready": 0, "clients": 0}
-            pool_breakdown[key][pool["status"]] += 1
+                pool_breakdown[key] = {
+                    "forming": 0, "training": 0, "idle": 0, "completing": 0, "clients": 0
+                }
+            status = pool.get("status")
+            if status in pool_breakdown[key]:
+                pool_breakdown[key][status] += 1
             pool_breakdown[key]["clients"] += len(pool.get("clients", []))
         mm_snapshot["poolBreakdown"] = pool_breakdown
     status_data = {"totalParticipants": total_participants,
@@ -3719,8 +3726,12 @@ async def get_stats(request: Request):
             gpu_arch = sig[4]
             key = f"{backend}-{autocast}-{gpu_arch}"
             if key not in pool_breakdown:
-                pool_breakdown[key] = {"forming": 0, "training": 0, "ready": 0, "clients": 0}
-            pool_breakdown[key][pool["status"]] += 1
+                pool_breakdown[key] = {
+                    "forming": 0, "training": 0, "idle": 0, "completing": 0, "clients": 0
+                }
+            status = pool.get("status")
+            if status in pool_breakdown[key]:
+                pool_breakdown[key][status] += 1
             pool_breakdown[key]["clients"] += len(pool.get("clients", []))
         mm["poolBreakdown"] = pool_breakdown
     return {"totalParticipants": total_users, "totalContributions": lora_stats.get("total_submissions", 0),
