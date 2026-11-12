@@ -408,7 +408,7 @@ CROSS_CHECK = {
     "TARGET_LOCAL_STEPS": _env_int("CROWDGPT_TARGET_LOCAL_STEPS", 500),
     "TARGET_AUTOCAST": os.getenv("CROWDGPT_TARGET_AUTOCAST", "any").strip().lower(),
     "TARGET_OPTIMIZER": os.getenv("CROWDGPT_TARGET_OPTIMIZER", "any").strip().lower(),
-    # v2.0: threshold raised to 5.0 — cross-arch tolerated, same backend/prec/optim
+    # Relaxed norm threshold accommodates legitimate variance within a hardware-locked pool.
     "DISTANCE_THRESHOLD_RATIO": _env_float("CROWDGPT_CROSS_CHECK_THRESHOLD", 5.0),
     "BAN_THRESHOLD": _env_int("CROWDGPT_BYZANTINE_BAN_THRESHOLD", 3),
 }
@@ -2644,7 +2644,7 @@ def _log_cross_check_summary():
     log.info(f"   → targetOptimizer={CROSS_CHECK['TARGET_OPTIMIZER']}")
     log.info(f"   → distance threshold={CROSS_CHECK['DISTANCE_THRESHOLD_RATIO']}x (2% absolute floor)")
     log.info(f"   → ban at {CROSS_CHECK['BAN_THRESHOLD']} subnet strikes")
-    log.info(f"   → BACKEND exact; OPTIM normalize(adamw32→adamw_fp32, adamw8bit) + wildcard; OPTIM mix fp32/8bit allowed")
+    log.info(f"   → BACKEND and ARCH exact; OPTIM normalize(adamw32→adamw_fp32, adamw8bit) + wildcard; OPTIM mix fp32/8bit allowed")
     log.info(f"   → ASYMMETRIC autocast: FP32 pools accept any client (forced fp32), BF16 pools accept bf16 only")
     log.info(f"   → POOL OPTIMIZER: weakest-link (any fp32-only member → whole pool trains fp32)")
     log.info(f"   → POOL AUTOCAST: same-cc → bf16; mixed-cc → fp32")
@@ -3823,7 +3823,7 @@ async def get_model_info():
             "bf16SoloDissolveS": MATCHMAKING["BF16_SOLO_DISSOLVE_S"],
             "fp32SoloDissolveS": MATCHMAKING["FP32_SOLO_DISSOLVE_S"],
             "hwBsTolerance": MATCHMAKING["HW_BS_TOLERANCE"],
-            "matchingRule": "v2.3: backend exact; optim normalize+wildcard+fp32/8bit mix; autocast asymmetric (fp32 pool accepts any, bf16 pool bf16 only); solo forming pools re-matched on every poll"},
+            "matchingRule": "v2.3: backend and architecture exact; optim normalize+wildcard+fp32/8bit mix; autocast asymmetric (fp32 pool accepts any, bf16 pool bf16 only); solo forming pools re-matched on every poll"},
         "huggingface": {"repoId": HF_REPO_ID, "enabled": HF_ENABLED, "revision": current_hf_revision,
             "revisionStep": hf_revision_global_step,
             "directDownloads": bool(_build_hf_weights_metadata("bf16"))} if HF_ENABLED else {}}
