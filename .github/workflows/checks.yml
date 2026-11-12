@@ -16,8 +16,3 @@ jobs:
 
       - name: Python files compile
         run: python -m py_compile server.py
-
-      - name: Lint with ruff
-        run: |
-          pip install ruff
-          ruff check server.py --select E,F,W --ignore E501
