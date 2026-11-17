@@ -99,7 +99,7 @@ import numpy as np
 import torch
 from fastapi import FastAPI, Request, Response, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, JSONResponse, FileResponse
+from fastapi.responses import StreamingResponse, JSONResponse, FileResponse, HTMLResponse
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import ClientDisconnect
 import ipaddress
@@ -157,15 +157,24 @@ tempfile.tempdir = str(WORK_TMP)   # NamedTemporaryFile(...) now lands here: swe
 try:
     from orchestrator import Orchestrator
     from orchestrator.objects import LocalObjectStore
+    from orchestrator.nodes import NodeRegistry, local_node_record, node_id_for
+    from orchestrator.records import (build_round_record, digest_of, merkle_root,
+                                      record_hash, sign_record)
+    from orchestrator.adversarial import plausible_loss
 except Exception as _orch_import_err:  # pragma: no cover - exercised by legacy deployments
     Orchestrator = None
     _ORCH_IMPORT_ERROR = _orch_import_err
+    def plausible_loss(x):   # fallback when the orchestrator package is absent (the real one is imported above otherwise)
+        try: v = float(x); return math.isfinite(v) and 0.0 <= v <= 100.0
+        except (TypeError, ValueError): return False
 else:
     _ORCH_IMPORT_ERROR = None
     LocalObjectStore = LocalObjectStore
 ORCH = None
 OBJECT_STORE = None
 CONTROL_PLANE = {"requests": 0, "bytesIn": 0, "bytesOut": 0, "round": 1}
+ROUND_BYTES_START = {"requests": 0, "bytesIn": 0, "bytesOut": 0}
+NODE_ID = None
 ORCH_DB_PATH = Path(os.getenv("CROWDGPT_ORCHESTRATOR_DB", str(BASE_DIR / "orchestrator_state.sqlite3")))
 
 def _open_orchestrator():
@@ -192,6 +201,18 @@ def _open_orchestrator():
                 obj_dir, secret=secret,
                 url_base=os.getenv("CROWDGPT_OBJECT_URL_BASE", "/fl/object"))
             log.info(f"📦 Object store: {obj_dir} (presigned PUT)")
+        try:
+            global NODE_ID
+            reg = NodeRegistry(ORCH.store)
+            rec = local_node_record(ORCH.identity,
+                endpoints=[os.getenv("CROWDGPT_PUBLIC_URL", "http://localhost:5006")],
+                roles=["leader", "witness", "validator"],
+                software_version="3.2", started_at=datetime.now(timezone.utc).isoformat())
+            reg.register(rec)
+            NODE_ID = rec["node_id"]
+            log.info(f"🪪 Node identity: {NODE_ID}")
+        except Exception as e:
+            log.warning(f"⚠️ node registration failed: {e}")
         return ORCH
     except Exception as e:
         log.error(f"❌ Could not open orchestrator state {ORCH_DB_PATH}: {e}")
@@ -220,7 +241,7 @@ HF_REPO_ID = "Vxtzq/Crowd-v1"
 DATASET_REPO_ID = "Vxtzq/CrowdGPT"
 HF_UPLOAD_INTERVAL_HOURS = 2
 HF_ENABLED = HF_AVAILABLE and bool(HF_TOKEN)
-ADMIN_SECRET = "PUT AN ADMIN SECRET HERE"
+ADMIN_SECRET = ""
 os.environ.setdefault("CROWDGPT_TRUSTED_PROXIES", "127.0.0.1/32,::1/128")
 HF_WEIGHT_FILES = ["model_bf16.safetensors", "engram_bf16.safetensors"]
 
@@ -259,6 +280,79 @@ log.info(f"🧮 SotaGPT size: {MODEL_SIZE:,} params (~{MODEL_SIZE*4/1024/1024:.2
 ENG_NUM_BUCKETS = 227865
 ENG_PARAMS = ENG_NUM_BUCKETS * MODEL_CONFIG["dim"]
 log.info(f"🧠 Engram size: {ENG_PARAMS:,} params (~{ENG_PARAMS*4/1024/1024:.2f} MB FP32)")
+
+# Fresh-run initialisation (PLAN.md §4): N(0,0.02) for every weight matrix, LayerNorm
+# weight 1 / bias 0.  "flat" keeps the pre-v2 behaviour of drawing N(0,0.02) for *all*
+# base parameters, LayerNorm included — that is what v1 actually ran with, and its
+# ln1.weight started at rms 0.02 instead of 1.  Kept selectable so the two runs stay
+# comparable; the documented init is the default.
+INIT_MODE = (os.getenv("CROWDGPT_INIT_MODE", "ln_identity") or "ln_identity").strip().lower()
+if INIT_MODE not in ("ln_identity", "flat"): INIT_MODE = "ln_identity"
+
+def flat_ln_slices(cfg: dict):
+    """(offset, numel, fill) of every LayerNorm entry in the flat base-weight buffer.
+
+    The order is the one clients see in `named_parameters()` (see sidecar
+    `packing/pack_flat.py::flat_layout`): wte, then per block ln1.w/ln1.b/q/k/v/o/
+    ln2.w/ln2.b/w1/w2/w3, then the final ln.w/ln.b.
+    """
+    d = cfg["dim"]; h = cfg.get("mlpHidden", 4 * d)
+    hd = cfg["headDim"]; nh = cfg["nHeads"]; nkv = cfg["nKvHeads"]
+    out = []
+    off = cfg["vocabSize"] * d
+    for _ in range(cfg["nLayers"]):
+        out.append((off, d, 1.0)); off += d          # ln1.weight
+        out.append((off, d, 0.0)); off += d          # ln1.bias
+        off += d * nh * hd + d * nkv * hd * 2 + d * d
+        out.append((off, d, 1.0)); off += d          # ln2.weight
+        out.append((off, d, 0.0)); off += d          # ln2.bias
+        off += d * h * 2 + h * d
+    out.append((off, d, 1.0)); off += d              # ln.weight
+    out.append((off, d, 0.0)); off += d              # ln.bias
+    assert off == calculate_model_size(cfg), (off, calculate_model_size(cfg))
+    return out
+def expected_init_norm(cfg: dict, mode: Optional[str] = None) -> float:
+    """‖W‖ a fresh run should report from its initialisation (G0)."""
+    mode = (mode or INIT_MODE)
+    slices = flat_ln_slices(cfg)
+    ones = sum(n for _o, n, f in slices if f == 1.0)
+    total = calculate_model_size(cfg)
+    if mode == "flat":
+        return math.sqrt(4e-4 * total)
+    return math.sqrt(4e-4 * (total - 2 * ones) + ones)
+
+
+def flat_norm(t, chunk: int = 10_000_000) -> float:
+    """‖·‖ of a flat buffer accumulated in float64.
+
+    ``Tensor.norm()`` accumulates the whole buffer in float32: at 657 M parameters it
+    under-reports by ~12 % (519.4 instead of the true 581.7), which is enough to fail the
+    G0 gate on a perfectly good initialisation. Chunked double accumulation matches
+    ``t.double().norm()`` to ~1e-9 without materialising a second full-size copy.
+    """
+    flat = t.reshape(-1)
+    total = float(flat.numel())
+    if total == 0:
+        return 0.0
+    sq = 0.0
+    for i in range(0, flat.numel(), chunk):
+        c = flat[i:i + chunk].to(torch.float64)
+        sq += float((c * c).sum())
+    return math.sqrt(sq)
+
+
+def build_init_weights(cfg: Optional[dict] = None, mode: Optional[str] = None):
+    """The exact buffer a fresh run starts from (seeded, so it is reproducible)."""
+    cfg = cfg or MODEL_CONFIG
+    mode = (mode or INIT_MODE)
+    total = calculate_model_size(cfg)
+    torch.manual_seed(42)
+    w = (torch.randn(total) * 0.02).float()
+    if mode == "ln_identity":
+        for off, n, fill in flat_ln_slices(cfg):
+            w[off:off + n] = fill
+    return w
+
 
 # ============ MEMORY GUARDS ============
 def _avail_mem_gb() -> float:
@@ -528,12 +622,40 @@ def _ticket_rejection(client_key: str, task_id: Optional[str] = None,
         log.warning(f"⚠️ ticket validation failed: {e}")
         return "ticket_unavailable"
 
+def _capture_client_key(client_key: str, request: Request) -> None:
+    pub = (request.headers.get("X-Client-Pubkey") or "").lower().strip()
+    if ORCH is None or len(pub) != 64 or any(c not in "0123456789abcdef" for c in pub):
+        return
+    try: ORCH.receipts.register_key(client_key, pub)
+    except Exception as e: log.warning(f"⚠️ client key persist failed: {e}")
+
+def _check_receipt(client_key: str, init_meta: Optional[dict]) -> Optional[str]:
+    receipt = (init_meta or {}).get("receipt")
+    if not receipt: return None
+    if ORCH is None: return "receipt_unavailable"
+    sig = (init_meta or {}).get("receiptSig") or ""
+    pub = (init_meta or {}).get("clientPubkey") or ""
+    if not sig or len(pub) != 64: return "receipt_signature_missing"
+    ok, reason = ORCH.receipts.verify_and_record(client_key, receipt, sig, pub)
+    if not ok: return reason
+    ticket = ORCH.admission.get(client_key)
+    if ticket is None: return "receipt_ticket_missing"
+    if receipt.get("ticket_id") != ticket.ticket_id: return "receipt_ticket_mismatch"
+    if int(receipt.get("round", -1)) != round_state["current_round"]: return "receipt_round_mismatch"
+    expected_base = hashlib.sha256(f"step:{global_step}".encode()).hexdigest()
+    if receipt.get("base_weights") != expected_base: return "receipt_base_mismatch"
+    fr = receipt.get("fingerprint_root")
+    if fr is not None and (not isinstance(fr, str) or len(fr) != 64):
+        return "receipt_fingerprint_invalid"
+    return None
+
 def _persist_ticket_consumed(client_key: str, task_id: Optional[str]):
     if ORCH is None: return
     try: ORCH.admission.consume(client_key, task_id)
     except Exception as e: log.warning(f"⚠️ ticket consume persist failed: {e}")
 
-def _persist_submission(pool: dict, client_key: str, delta_path: str, meta: dict):
+def _persist_submission(pool: dict, client_key: str, delta_path: str, meta: dict,
+                        user_uuid: Optional[str] = None):
     if ORCH is None: return
     try:
         content = meta.get("checksum")
@@ -550,6 +672,7 @@ def _persist_submission(pool: dict, client_key: str, delta_path: str, meta: dict
             tokens=int(meta.get("tokensProcessed", 0) or 0),
             steps=int(meta.get("localSteps", 0) or 0),
             loss_reported=None if loss is None else f"{float(loss):.6f}",
+            user_uuid=user_uuid,
         )
     except Exception as e:
         log.warning(f"⚠️ submission persist failed: {e}")
@@ -627,7 +750,9 @@ FL_CONFIG = {
     "DELTA_NORM_BASE": 500.0, "DELTA_NORM_ABSOLUTE_MAX": 5000.0,
     "SERVER_LR": 1.0, "WEIGHT_DECAY": 0.00,
     "MAX_WEIGHT_NORM": 10000000000.0,
-    "MAX_DELTA_APPLY_NORM": 1200.0,
+    # A3: per-delta clip is a tripwire, not a routine nonlinearity (~10x the norm a normal
+    # round produces).  When it fires it is logged; tune it from the sweep's measured ‖Δ‖.
+    "MAX_DELTA_APPLY_NORM": 12000.0,
     "LR_DECAY_STEPS": 50_000, "MIN_LR_MULT": 0.05,
     "IP_TIMEOUT_S": 900, "SHARD_TIMEOUT_S": 1800, "CLEANUP_INTERVAL_S": 60,
     "SHUFFLE_CHUNKS": True,
@@ -645,6 +770,9 @@ def _env_int(name, default):
 def _env_float(name, default):
     try: return float(os.getenv(name, str(default)))
     except Exception: return default
+# FL_CONFIG is built before _env_float exists; apply the env override here.
+FL_CONFIG["MAX_DELTA_APPLY_NORM"] = _env_float("CROWDGPT_MAX_DELTA_APPLY_NORM",
+                                               FL_CONFIG["MAX_DELTA_APPLY_NORM"])
 def _parse_cidrs(raw):
     nets = []
     for part in (raw or "").split(","):
@@ -714,7 +842,7 @@ if CROSS_CHECK["COHORT_SIZE"] < 2: CROSS_CHECK["COHORT_SIZE"] = 3
 #   "strict" like "arch" but also the same card model (4090 with 4090 only)
 #   "on"     previous behaviour (bf16 pools may mix generations)
 # Power-solo pools are not cross-checked, so they keep the client's native precision in every mode.
-POOL_BF16 = os.getenv("CROWDGPT_POOL_BF16", "arch").strip().lower()
+POOL_BF16 = False #os.getenv("CROWDGPT_POOL_BF16", "arch").strip().lower()
 if POOL_BF16 not in ("off", "arch", "strict", "on"): POOL_BF16 = "arch"
 if CROSS_CHECK["MAX_OVERFLOW"] < 0: CROSS_CHECK["MAX_OVERFLOW"] = 0
 if CROSS_CHECK["MAX_OVERFLOW"] > 2: CROSS_CHECK["MAX_OVERFLOW"] = 2
@@ -790,7 +918,9 @@ def _rate_limit_auth(ip: str, bucket: dict, max_per_window: int, window_s: int) 
         bucket[ip] = arr
         return True
 
-BAD_WORDS = ["PUT BAD WORDS HERE"]
+BAD_WORDS = ["fuck", "shit", "ass", "bitch", "dick", "cock", "pussy", "cunt", "bastard", "damn", "piss", "crap", "twat",
+    "nigger", "nigga", "faggot", "fag", "retard", "tranny", "whore", "slut", "rape", "pedo", "nazi", "hitler",
+    "porn", "xxx", "hentai", "admin", "administrator", "root", "system", "moderator", "mod", "staff", "official"]
 
 def load_users_db():
     global users_db
@@ -937,7 +1067,198 @@ def _peer_in_trusted(request: Request) -> bool:
     except Exception: return False
     return any(a in n for n in HARDEN["TRUSTED_PROXY_NETS"])
 
+# ════════════════════════════════════════════════════════════════════
+# DROP-IN: country detection from Cloudflare CF-IPCountry
+# ════════════════════════════════════════════════════════════════════
 
+# ══════════════════════════════════════════════════════════════════════
+# PATCH: IP-based country lookup (fallback when cf-ipcountry unavailable)
+# Install one of:
+#   pip install iptocc     # ~2 MB, data bundled, no external file
+#   pip install geoip2     # needs GeoLite2-Country.mmdb next to server.py
+# ══════════════════════════════════════════════════════════════════════
+_GEOIP_BACKEND = None
+_IPT_OCC_LOOKUP = None
+_GEOIP2_READER  = None
+
+try:
+    from iptocc import country_code as _IPT_OCC_LOOKUP  # noqa: F401
+    _GEOIP_BACKEND = "iptocc"
+except ImportError:
+    _IPT_OCC_LOOKUP = None
+    try:
+        import geoip2.database as _geoip2  # noqa: F401
+        _mmdb = BASE_DIR / "GeoLite2-Country.mmdb"
+        if _mmdb.exists():
+            _GEOIP2_READER = _geoip2.Reader(str(_mmdb))
+            _GEOIP_BACKEND = "geoip2"
+    except ImportError:
+        _geoip2 = None
+        _GEOIP2_READER = None
+
+if _GEOIP_BACKEND:
+    log.info(f"🌍 IP country fallback: {_GEOIP_BACKEND}")
+else:
+    log.info("🌍 IP country fallback: DISABLED (pip install iptocc to enable)")
+
+
+def _lookup_country_by_ip(ip: str) -> Optional[str]:
+    """Best-effort ISO-3166 alpha-2 country from an IP. Returns None on miss."""
+    if not ip or ip == "unknown":
+        return None
+    ip = ip.strip("[]")
+    if _GEOIP_BACKEND == "iptocc" and _IPT_OCC_LOOKUP is not None:
+        try:
+            cc = _IPT_OCC_LOOKUP(ip)
+            if cc and len(cc) == 2 and cc.upper() != "XX":
+                return cc.upper()
+        except Exception:
+            return None
+    elif _GEOIP_BACKEND == "geoip2" and _GEOIP2_READER is not None:
+        try:
+            resp = _GEOIP2_READER.country(ip)
+            if resp and resp.country.iso_code:
+                return resp.country.iso_code.upper()
+        except Exception:
+            return None
+    return None
+
+
+# ══════════════════════════════════════════════════════════════════════
+# PATCH: persistent country store (survives restart, powers mode=all_time)
+# ══════════════════════════════════════════════════════════════════════
+USER_COUNTRIES_FILE = DATA_DIR / "user_countries.json"
+user_countries: Dict[str, dict] = {}
+user_countries_lock = threading.Lock()
+_country_save_pending = False
+
+
+def _canonical_country_id(client_key: str) -> str:
+    """Dedup per user (3 devices → 1 person). Anonymous stays per-IP."""
+    uid = _user_id_from_key(client_key)   # resolved at runtime, fine
+    return f"user:{uid}" if uid else client_key
+
+
+def _load_user_countries():
+    global user_countries
+    try:
+        if USER_COUNTRIES_FILE.exists():
+            with open(USER_COUNTRIES_FILE, "r", encoding="utf-8") as f:
+                user_countries = json.load(f)
+            log.info(f"🌍 Loaded {len(user_countries)} persisted country entries")
+    except Exception as e:
+        log.warning(f"country load failed: {e}")
+        user_countries = {}
+
+
+def _save_user_countries():
+    global _country_save_pending
+    _country_save_pending = False
+    try:
+        with user_countries_lock:
+            snapshot = dict(user_countries)
+        tmp = USER_COUNTRIES_FILE.with_suffix(".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(snapshot, f, indent=2, sort_keys=True)
+        os.replace(tmp, USER_COUNTRIES_FILE)
+    except Exception as e:
+        log.warning(f"country save failed: {e}")
+
+
+def _schedule_country_save():
+    """Debounce: at most one disk write per 60s, covering all changes."""
+    global _country_save_pending
+    with user_countries_lock:
+        if _country_save_pending:
+            return
+        _country_save_pending = True
+    t = threading.Timer(60.0, _save_user_countries)
+    t.daemon = True
+    t.start()
+
+
+def _record_user_country(client_key: str, cc: str, ip: str = ""):
+    now = time.time()
+    cid = _canonical_country_id(client_key)
+    with user_countries_lock:
+        entry = user_countries.get(cid)
+        if entry:
+            entry["country"]   = cc
+            entry["last_seen"] = now
+            if ip: entry["last_ip"] = ip
+        else:
+            user_countries[cid] = {
+                "country":    cc,
+                "first_seen": now,
+                "last_seen":  now,
+                "last_ip":    ip or "",
+            }
+    _schedule_country_save()
+
+def get_client_country(request: Request) -> Optional[str]:
+    """Prefer cf-ipcountry when the peer is trusted.
+    Fall back to IP-based lookup so this works even without Cloudflare."""
+    raw = request.headers.get("cf-ipcountry")
+    if raw:
+        cc = raw.strip().upper()
+        if len(cc) == 2 and cc != "XX":
+            nets = HARDEN["TRUSTED_PROXY_NETS"]
+            if not nets or _peer_in_trusted(request):
+                return cc
+    return _lookup_country_by_ip(get_client_ip(request))
+
+
+try:
+    import pycountry as _pycountry
+except ImportError:
+    _pycountry = None
+
+_ALPHA2_NUMERIC: Optional[dict] = None
+
+def _alpha2_to_numeric(cc: str) -> Optional[str]:
+    """'US' -> '840'. pycountry when available, else a built-in fallback
+    for the ~60 most likely countries (enough to render the map even
+    if you don't install pycountry)."""
+    global _ALPHA2_NUMERIC
+    if _ALPHA2_NUMERIC is None:
+        m: dict = {}
+        if _pycountry is not None:
+            for c in _pycountry.countries:
+                a, n = getattr(c, "alpha_2", None), getattr(c, "numeric", None)
+                if a and n:
+                    m[a.upper()] = n
+        if not m:
+            m = {
+                "US":"840","GB":"826","FR":"250","DE":"276","JP":"392","CN":"156",
+                "IN":"356","BR":"076","RU":"643","CA":"124","AU":"036","NL":"528",
+                "ES":"724","IT":"380","KR":"410","MX":"484","PL":"616","SE":"752",
+                "NO":"578","FI":"246","DK":"208","CH":"756","AT":"040","BE":"056",
+                "IE":"372","PT":"620","GR":"300","TR":"792","IL":"376","AE":"784",
+                "SA":"682","ZA":"710","NG":"566","EG":"818","KE":"404","AR":"032",
+                "CL":"152","CO":"170","PE":"604","VE":"862","UA":"804","CZ":"203",
+                "RO":"642","HU":"348","BG":"100","SG":"702","MY":"458","TH":"764",
+                "VN":"704","PH":"608","ID":"360","NZ":"554","HK":"344","TW":"158",
+                "XK":"383",
+            }
+        _ALPHA2_NUMERIC = m
+    return _ALPHA2_NUMERIC.get((cc or "").upper())
+
+
+def stamp_client_country(request: Request) -> Optional[str]:
+    """Stamp client_hardware[ck]['country'] and persist to user_countries.
+    Cheap, idempotent, safe to call on every request."""
+    try:
+        cc = get_client_country(request)
+        if not cc:
+            return None
+        ck = get_client_key(request)
+        hw = client_hardware.get(ck)
+        if hw is not None and hw.get("country") != cc:
+            hw["country"] = cc
+        _record_user_country(ck, cc, get_client_ip(request))
+        return cc
+    except Exception:
+        return None
 
 def get_client_ip(request: Request) -> str:
     nets = HARDEN["TRUSTED_PROXY_NETS"]
@@ -1223,6 +1544,7 @@ def _gpu_arch_class(gpu_name: str) -> str:
     if any(x in g for x in ("2080","2070","2060","rtx 20","t4","titan rtx","quadro rtx")): return "turing"
     if any(x in g for x in ("1080","1070","1060","1050","titan x","titan v")): return "pascal"
     if "v100" in g: return "volta"
+    if "arc" in g: return "intel_arc"
     if any(x in g for x in ("radeon","mi250","mi300","mi210","mi100")): return "rocm"
     return "unknown"
 
@@ -1241,6 +1563,21 @@ def _gpu_card_class(gpu_name: str) -> str:
     if "t4" in g: return "t4"
     if "v100" in g: return "v100"
     return _gpu_arch_class(gpu_name)
+
+def _pool_hardware_breakdown(pool_list) -> dict:
+    breakdown = {}
+    for pool in pool_list:
+        sig = pool.get("hardware_sig", ())
+        if len(sig) < 5: continue
+        key = f"{sig[0]}-{sig[2]}-{sig[4]}"
+        counts = breakdown.setdefault(key, {
+            "forming": 0, "training": 0, "idle": 0, "completing": 0, "clients": 0
+        })
+        status = pool.get("status")
+        if status in counts:
+            counts[status] += 1
+        counts["clients"] += len(pool.get("clients", []))
+    return breakdown
 
 def _force_fp32_arch(gpu_name: str) -> bool:
     a = _gpu_arch_class(gpu_name)
@@ -1470,6 +1807,12 @@ def _merge_pool_deltas_locked(pool_id: str, survivors: list, chunk_size: int) ->
                 log.error(f"Merge: cannot open {path}: {e}")
                 return None
         total_tokens = sum(df.tokens for df in dfs)
+        merged_steps = None
+        for path, _w in survivors:
+            merged_steps = _delta_opt_steps(_delta_metadata(path))
+            if merged_steps is not None: break
+        meta_common = {"tokensProcessed": total_tokens, "tokens": total_tokens}
+        if merged_steps is not None: meta_common["optimizerSteps"] = int(merged_steps)
         weights = [w for _, w in survivors]
         wsum = sum(weights)
         if wsum <= 0: wsum = 1.0
@@ -1478,7 +1821,7 @@ def _merge_pool_deltas_locked(pool_id: str, survivors: list, chunk_size: int) ->
         engram_acc = {}
         with open(merged_path, 'wb') as out_f:
             out_f.write(struct.pack('<I', _MERGE_META_PAD))
-            out_f.write(_merge_meta_bytes({"delta_norm": 0.0, "tokensProcessed": total_tokens, "tokens": total_tokens}))
+            out_f.write(_merge_meta_bytes({"delta_norm": 0.0, **meta_common}))
             for offset in range(0, MODEL_SIZE, chunk_size):
                 read_size = min(chunk_size, MODEL_SIZE - offset)
                 sum_chunk = torch.zeros(read_size, dtype=torch.float32)
@@ -1523,7 +1866,7 @@ def _merge_pool_deltas_locked(pool_id: str, survivors: list, chunk_size: int) ->
                 out_f.write(struct.pack('<I', 0))
             out_f.seek(0)       # real header (same fixed length) now that the norm is known
             out_f.write(struct.pack('<I', _MERGE_META_PAD))
-            out_f.write(_merge_meta_bytes({"delta_norm": math.sqrt(norm_sq), "tokensProcessed": total_tokens, "tokens": total_tokens}))
+            out_f.write(_merge_meta_bytes({"delta_norm": math.sqrt(norm_sq), **meta_common}))
         for path, _ in survivors:
             try: os.remove(path)
             except Exception: pass
@@ -1542,13 +1885,18 @@ def _merge_pool_deltas_locked(pool_id: str, survivors: list, chunk_size: int) ->
 def _merge_power_solo(pool: dict, survivors: list):
     entry = next((e for e in ready_pools if e.get("pool_id") == POWER_POOL_ID), None)
     if entry is None:
-        entry = {"pool_id": POWER_POOL_ID, "chunk_idx": pool.get("chunk_idx"), "deltas": [], "_tokens": {}}
+        entry = {"pool_id": POWER_POOL_ID, "chunk_idx": pool.get("chunk_idx"), "deltas": [],
+                 "_tokens": {}, "tokens": 0, "optimizerSteps": None}
         ready_pools.append(entry)
     for path, _w in survivors:
         try: tok = max(1, int(open_delta(path, MODEL_SIZE).tokens))
         except Exception: tok = 1
         entry["_tokens"][path] = tok
     total = sum(entry["_tokens"].values()) or 1
+    entry["tokens"] = total
+    _stats = _pool_delta_stats(survivors)
+    if _stats.get("optimizerSteps") is not None:
+        entry["optimizerSteps"] = _stats["optimizerSteps"]
     paths_weights = [(p, POWER["SOLO_WEIGHT"] * t / total) for p, t in entry["_tokens"].items()]
     total_w = sum(w for _, w in paths_weights)
     if len(paths_weights) > 1:
@@ -1611,9 +1959,10 @@ def _matchmake(client_key: str, power: bool = False) -> dict:
             #   - one account + multiple X-Client-Device headers
             #   - N accounts registered from one IP joining the same pool
             #   - one anonymous host on the same IP joining twice
-            if _pool_contains_same_actor(pool, client_key):
-                log.info(f"🚫 {client_key}: skipping pool {pool['pool_id']} (same actor already present)")
-                continue
+            # TEMPORARILY DISABLED FOR LOAD TESTING
+            # if _pool_contains_same_actor(pool, client_key):
+            #     log.info(f"🚫 {client_key}: skipping pool {pool['pool_id']} (same actor already present)")
+            #     continue
             if power and not POWER["JOIN_ANY_POOL"] and len(pool["clients"]) + 1 < MATCHMAKING["POOL_SIZE"]: continue
             candidates.append(pool)
 
@@ -1706,8 +2055,9 @@ def _build_task_payload(pool: dict, client_key: str) -> dict:
             "harmonizeMode": "strict" if CROSS_CHECK["TARGET_BATCH_SIZE"] > 0 else "per_client_bs",
             "instruction": ("Train on the assigned shard with EXACTLY: "
                 "seed=targetSeed, micro_steps=targetLocalSteps, "
-                "batch_size=min(your_max_bs, targetBatchSize), "
-                "accum_steps=targetAccumSteps, autocast=targetAutocast. "
+                "batch_size=min(your_max_bs, targetBatchSize), autocast=targetAutocast. "
+                "Use accum_steps=targetAccumSteps; report the actual optimizerSteps and accum in "
+                "the submit body. "
                 "If targetOptimizer is set (adamw_fp32/adamw8bit), use that optimizer. "
                 "Report actualOptimizer in submit body.")},
     }
@@ -1844,6 +2194,138 @@ def _pub_pool_result(pool: dict, survivors) -> None:
                   power_solo=bool(pool.get("power")))
     except Exception: pass
 
+def _model_digest() -> str:
+    h = hashlib.sha256()
+    for t in (global_weights, global_engram_weights):
+        if t is None: continue
+        view = t.detach().cpu().contiguous().view(torch.uint8).numpy()
+        h.update(memoryview(view))
+    return h.hexdigest()
+
+def _round_roots(rnd: int) -> tuple[str, str, str]:
+    tickets = ORCH.admission.load_all(rnd) if ORCH is not None else {}
+    t_leaves = [digest_of({"ticket": t.ticket_id, "client": t.client_key,
+                           "task": t.task_id, "round": t.round})
+                for t in tickets.values()]
+    subs = ORCH.submission.load_submissions(round_no=rnd) if ORCH is not None else []
+    s_leaves = [digest_of({"id": s.submission_id, "client": s.client_key,
+                           "content": s.content_sha256, "tokens": s.tokens})
+                for s in subs]
+    d_leaves = [digest_of({"content": s.content_sha256, "path": s.delta_path or ""})
+                for s in subs]
+    return merkle_root(t_leaves), merkle_root(s_leaves), merkle_root(d_leaves)
+
+def _round_eval(held) -> Optional[dict]:
+    """Held-out evaluation for a round, or None when nothing was evaluated.
+
+    A configured loss-check service is the first source. Otherwise an
+    ``CROWDGPT_EVAL_URL`` sidecar may return ``{loss, ciLow, ciHigh, windows,
+    manifestSha256, modelSha256, source}``. A round without either stays
+    explicitly unevaluated; it is never filled with a reported training loss.
+    """
+    if held is not None:
+        try:
+            return {"mode": HARDEN["LOSS_CHECK_MODE"], "loss": f"{float(held):.6f}",
+                    "ciLow": None, "ciHigh": None, "windows": None, "source": "loss_check",
+                    "manifestSha256": None, "evaluatedAt": datetime.now(timezone.utc).isoformat()}
+        except (TypeError, ValueError):
+            return None
+    url = os.getenv("CROWDGPT_EVAL_URL", "").strip()
+    if not url:
+        return None
+    try:
+        r = requests.post(url.rstrip("/") + "/eval", json={
+            "round": round_state["current_round"], "globalStep": global_step,
+            "checkpoint": str(LATEST_CHECKPOINT_FILE),
+        }, timeout=float(os.getenv("CROWDGPT_EVAL_TIMEOUT_S", "1800")))
+        if not r.ok:
+            log.warning(f"⚠️ evaluator HTTP {r.status_code}: {r.text[:200]}")
+            return None
+        body = r.json()
+        loss = body.get("loss")
+        if loss is None:
+            return None
+        return {"mode": "heldout", "loss": f"{float(loss):.6f}",
+                "ciLow": body.get("ciLow"), "ciHigh": body.get("ciHigh"),
+                "windows": body.get("windows"),
+                "manifestSha256": body.get("manifestSha256"),
+                "modelSha256": body.get("modelSha256"), "source": "eval_service",
+                "evaluatedAt": datetime.now(timezone.utc).isoformat()}
+    except Exception as exc:
+        log.warning(f"⚠️ evaluator unavailable: {exc}")
+        return None
+
+def _write_nutrition(rec: dict, rnd: int, eval_result: Optional[dict]) -> None:
+    try:
+        subs = ORCH.submission.load_submissions(round_no=rnd) if ORCH is not None else []
+        receipts = ORCH.receipts.all(rnd) if ORCH is not None else []
+        contributors = len({r.get("client_key") for r in receipts if r.get("client_key")})
+        nutrition = {
+            "schema": "ng-nutrition-1",
+            "model": {"repo": HF_REPO_ID, "revision": current_hf_revision,
+                      "globalStep": int(global_step), "baseWeights": rec.get("base_weights"),
+                      "aggregateWeights": rec.get("aggregate_weights")},
+            "round": int(rnd), "leader": rec.get("leader"),
+            "codeVersions": list(rec.get("code_versions") or []),
+            "tokens": {"verified": sum(int(s.tokens) for s in subs),
+                       "reported": int(global_stats.get("totalTokens", 0))},
+            "contributors": contributors,
+            "trainedParameters": sorted({p for t in db["tasks"].values()
+                                         for p in (t.get("trainedParams") or [])}),
+            "evaluation": eval_result or {"status": "unevaluated"},
+            "limitations": [
+                "Reported training loss is not a held-out evaluation.",
+                "A leader signature is not a witness quorum until P6.6 is operated.",
+                "Bulk weights and deltas live outside the signed record.",
+            ],
+            "writtenAt": datetime.now(timezone.utc).isoformat(),
+        }
+        tmp = DATA_DIR / "nutrition.json.tmp"
+        tmp.write_text(json.dumps(nutrition, indent=2, sort_keys=True), encoding="utf-8")
+        os.replace(tmp, DATA_DIR / "nutrition.json")
+    except Exception as exc:
+        log.warning(f"⚠️ nutrition write failed: {exc}")
+
+def _publish_round_record(rnd: int, success: bool, loss_rejected: bool, n_pools: int,
+                          held=None) -> None:
+    if ORCH is None: return
+    try:
+        view = ORCH.scheduling.load_round(rnd)
+        if view is None: return
+        opened = datetime.fromtimestamp(view.started_at, tz=timezone.utc).isoformat()
+        closed = datetime.now(timezone.utc).isoformat()
+        tickets_root, submissions_root, deltas_root = _round_roots(rnd)
+        prev = None
+        prior = ORCH.publication.all_rounds()
+        if prior: prev = record_hash(prior[-1]["record"])
+        weights_hash = _model_digest()
+        rec = build_round_record(
+            round_no=rnd, opened_at=opened, closed_at=closed,
+            base_weights=digest_of({"model": weights_hash,
+                                    "step": view.global_step - (1 if success else 0)}),
+            aggregate_weights=digest_of({"model": weights_hash,
+                                         "step": view.global_step}),
+            leader=NODE_ID or "node-unknown", witnesses=(),
+            tickets_root=tickets_root, submissions_root=submissions_root,
+            deltas_root=deltas_root, prev_record_hash=prev, eval=_round_eval(held),
+            bytes_down=max(0, CONTROL_PLANE["bytesOut"] - ROUND_BYTES_START["bytesOut"]),
+            bytes_up=max(0, CONTROL_PLANE["bytesIn"] - ROUND_BYTES_START["bytesIn"]),
+            code_versions=("3.2",))
+        rec = sign_record(rec, ORCH.identity, NODE_ID or "node-unknown")
+        ORCH.publication.publish_round(rnd, rec)
+        _write_nutrition(rec, rnd, rec.get("eval"))
+        mirror = os.getenv("CROWDGPT_AUDIT_MIRROR", "").strip()
+        if mirror:
+            try:
+                Path(mirror).parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(BASE_DIR / "data" / "public_rounds.jsonl", mirror)
+            except Exception as e:
+                log.warning(f"⚠️ audit mirror failed: {e}")
+        ROUND_BYTES_START.update({k: CONTROL_PLANE[k] for k in ROUND_BYTES_START})
+        log.info(f"🧾 Signed round record {rnd} ({record_hash(rec)[:12]}…)")
+    except Exception as e:
+        log.warning(f"⚠️ signed round record failed: {e}")
+
 def _pub_round_end(rnd: int, success: bool, loss_rejected: bool, n_pools: int) -> None:
     try:
         held = loss_ratchet_state.get("lastAcceptedLoss") if HARDEN["LOSS_CHECK_MODE"] != "off" else None
@@ -1851,13 +2333,7 @@ def _pub_round_end(rnd: int, success: bool, loss_rejected: bool, n_pools: int) -
         PUB.event("round_end", round=rnd, step=global_step, pools=n_pools, applied=bool(success),
                   rolled_back=bool(loss_rejected), loss=row.get("loss"), heldout=held)
         PUB.event("round_start", round=rnd + 1, step=global_step)
-        if ORCH is not None:
-            ORCH.publication.publish_round(rnd, {
-                "schema": "ng-legacy-1", "round": rnd, "step": global_step,
-                "success": bool(success), "lossRejected": bool(loss_rejected),
-                "pools": int(n_pools), "lossReported": row.get("loss"),
-                "lossHeldOut": held, "source": "coordinator",
-            })
+        _publish_round_record(rnd, success, loss_rejected, n_pools, held=held)
         PUB.export_static()
     except Exception: pass
 
@@ -1868,6 +2344,8 @@ def _complete_pool_sync(pool: dict):
         _persist_pool_status(pool, "completing")
         survivors = _run_pool_cross_check(pool)
         _pub_pool_result(pool, survivors)
+        # read the A3 metadata before taking the pool lock (it touches the delta headers on disk)
+        stats = _pool_delta_stats(survivors) if survivors else {"tokens": 0, "optimizerSteps": None}
         with pool_lock:
             if survivors and pool.get("power") and len(pool["clients"]) == 1:
                 _merge_power_solo(pool, survivors)
@@ -1875,13 +2353,20 @@ def _complete_pool_sync(pool: dict):
                 if len(survivors) > 1:
                     merged = _merge_pool_deltas(pool_id, survivors)
                     if merged:
-                        ready_pools.append({"pool_id": pool_id, "chunk_idx": pool["chunk_idx"], "deltas": [(merged, 1.0)]})
-                        log.info(f"📦 Pool {pool_id}: merged {len(survivors)} deltas into 1")
+                        ready_pools.append({"pool_id": pool_id, "chunk_idx": pool["chunk_idx"],
+                                            "deltas": [(merged, 1.0)],
+                                            "target_steps": pool.get("target_steps"), **stats})
+                        log.info(f"📦 Pool {pool_id}: merged {len(survivors)} deltas into 1 "
+                                 f"(tokens={stats['tokens']:,}, optSteps={stats['optimizerSteps'] or 'legacy'})")
                     else:
                         log.warning(f"⚠️ Pool {pool_id}: merge failed, keeping {len(survivors)} deltas")
-                        ready_pools.append({"pool_id": pool_id, "chunk_idx": pool["chunk_idx"], "deltas": survivors})
+                        ready_pools.append({"pool_id": pool_id, "chunk_idx": pool["chunk_idx"],
+                                            "deltas": survivors,
+                                            "target_steps": pool.get("target_steps"), **stats})
                 else:
-                    ready_pools.append({"pool_id": pool_id, "chunk_idx": pool["chunk_idx"], "deltas": survivors})
+                    ready_pools.append({"pool_id": pool_id, "chunk_idx": pool["chunk_idx"],
+                                        "deltas": survivors,
+                                        "target_steps": pool.get("target_steps"), **stats})
             pools.pop(pool_id, None)
             _persist_pool_removed(pool_id)
     except Exception as e:
@@ -1971,10 +2456,14 @@ def _pool_cleanup_tick():
 # ============ MODEL WEIGHTS ============
 def initialize_model():
     global global_weights, global_engram_weights
-    torch.manual_seed(42)
-    global_weights = (torch.randn(MODEL_SIZE) * 0.02).float()
+    global_weights = build_init_weights()
     global_engram_weights = (torch.randn(ENG_PARAMS) * 0.02).float()
-    log.info(f"🎲 initialized {MODEL_SIZE:,} base + {ENG_PARAMS:,} engram weights (FP32 master)")
+    wn = flat_norm(global_weights)
+    exp = expected_init_norm(MODEL_CONFIG)
+    log.info(f"🎲 initialized {MODEL_SIZE:,} base + {ENG_PARAMS:,} engram weights (FP32 master), "
+             f"mode={INIT_MODE}, ‖W‖={wn:.2f} (expected ≈{exp:.2f})")
+    if abs(wn - exp) > 0.5:
+        log.warning(f"⚠️ G0 init check failed: ‖W‖={wn:.2f}, expected ≈{exp:.2f} for mode={INIT_MODE}")
 
 def load_global_state():
     global global_step, global_stats, lora_stats
@@ -2156,6 +2645,10 @@ def upload_to_huggingface(retries: int = 3) -> bool:
                     "globalStep": global_step, "modelSize": MODEL_SIZE, "engramParams": ENG_PARAMS,
                     "uploadedAt": datetime.now(timezone.utc).isoformat()}
                 with open(temp_dir / "training_state.json", 'w', encoding='utf-8') as f: json.dump(config_data, f, indent=2)
+                _audit_jsonl = BASE_DIR / "data" / "public_rounds.jsonl"
+                if _audit_jsonl.exists(): shutil.copy2(_audit_jsonl, temp_dir / "rounds.jsonl")
+                _nutrition = DATA_DIR / "nutrition.json"
+                if _nutrition.exists(): shutil.copy2(_nutrition, temp_dir / "nutrition.json")
                 commit = api.upload_folder(folder_path=str(temp_dir), repo_id=HF_REPO_ID, repo_type="model",
                     commit_message=f"Update step {global_step} round {round_state['current_round']}")
                 rev = _extract_commit_sha(commit) or _latest_hf_revision()
@@ -2211,20 +2704,7 @@ def update_and_save_status(push_hf: bool = True):
             "formingPools": sum(1 for p in pools.values() if p["status"] == "forming"),
             "trainingPools": sum(1 for p in pools.values() if p["status"] == "training"),
             "readyPools": len(ready_pools)}
-        # Aggregate pool hardware breakdown by backend/precision/arch
-        pool_breakdown = {}
-        for pool in pools.values():
-            sig = pool.get("hardware_sig", ())
-            if len(sig) < 5: continue
-            backend = sig[0]
-            autocast = sig[2]
-            gpu_arch = sig[4]
-            key = f"{backend}-{autocast}-{gpu_arch}"
-            if key not in pool_breakdown:
-                pool_breakdown[key] = {"forming": 0, "training": 0, "ready": 0, "clients": 0}
-            pool_breakdown[key][pool["status"]] += 1
-            pool_breakdown[key]["clients"] += len(pool.get("clients", []))
-        mm_snapshot["poolBreakdown"] = pool_breakdown
+        mm_snapshot["poolBreakdown"] = _pool_hardware_breakdown(pools.values())
     status_data = {"totalParticipants": total_participants,
         "totalContributions": lora_stats.get("total_submissions", 0),
         "activeGpus": active_gpus, "totalTokens": total_tokens,
@@ -2655,6 +3135,7 @@ def round_watchdog():
                             if not _finish_with_loss_check(step_before):
                                 loss_rejected = True; success = False
                     else: log.warning("⚠️ Round ended with no completed pools")
+                    ended_round_started_at = round_state["round_start_time"]
                     with shard_lock:
                         if success or loss_rejected:
                             current_data_shard["consumed"] = True
@@ -2670,7 +3151,7 @@ def round_watchdog():
                         round_state["force_end_at"] = None
                     if ORCH is not None:
                         try: ORCH.scheduling.save_round(current_round_ending, state="closed",
-                                                        started_at=round_state["round_start_time"],
+                                                        started_at=ended_round_started_at,
                                                         duration_hours=round_state["round_duration_hours"],
                                                         last_aggregation_at=round_state["last_aggregation_time"],
                                                         force_end_at=None, global_step=global_step,
@@ -2712,6 +3193,10 @@ def process_decompressed_payload(dec_path: str, client_ip: str, client_key: str,
                           "ticket_consumed", "base_weights_changed"):
         log.warning(f"🚫 {client_key}: ticket rejected ({_ticket_reason})")
         raise HTTPException(status_code=403, detail={"reason": _ticket_reason})
+    _receipt_reason = _check_receipt(client_key, init_meta)
+    if _receipt_reason:
+        log.warning(f"🚫 {client_key}: receipt rejected ({_receipt_reason})")
+        raise HTTPException(status_code=403, detail={"reason": _receipt_reason})
     temp_delta_path = None; final_delta_path = None
     try:
         with open(dec_path, 'rb') as dec_f:
@@ -2847,12 +3332,27 @@ def process_decompressed_payload(dec_path: str, client_ip: str, client_key: str,
             except Exception: local_steps = 1
             if local_steps <= 0: local_steps = 1
             local_steps = min(local_steps, HARDEN["MAX_LOCAL_STEPS"])
-            loss_raw = body.get("loss"); loss_float = None
+            # A3: the client reports the optimizer steps it actually took (and its accum), so the
+            # aggregate can be normalised by steps instead of by an assumed trajectory length.
+            # Absent fields mean a legacy client; they are stored as absent, never guessed.
+            try: opt_steps = int(body.get("optimizerSteps") or 0)
+            except Exception: opt_steps = 0
+            if opt_steps < 0: opt_steps = 0
+            if opt_steps > local_steps: opt_steps = local_steps
+            try: accum_steps = int(body.get("accum") or 0)
+            except Exception: accum_steps = 0
+            if accum_steps < 0: accum_steps = 0
+            if accum_steps > HARDEN["MAX_LOCAL_STEPS"]: accum_steps = HARDEN["MAX_LOCAL_STEPS"]
+            loss_raw = body.get("loss", (init_meta or {}).get("loss")); loss_float = None
             try:
                 if loss_raw is not None:
                     loss_float = float(loss_raw)
                     if math.isnan(loss_float) or math.isinf(loss_float): loss_float = None
             except Exception: loss_float = None
+            if loss_float is not None and not plausible_loss(loss_float):
+                log.warning(f"🚫 {client_key}: implausible reported loss {loss_float}")
+                PUB.event("implausible_loss", client=PUB.who(client_key), loss=loss_float)
+                raise HTTPException(status_code=400, detail={"reason": "implausible_loss"})
             max_allowed = compute_max_allowed_norm(local_steps, rank)
             abs_max = max(FL_CONFIG["DELTA_NORM_ABSOLUTE_MAX"], max_allowed * 3)
             if delta_norm > abs_max:
@@ -2866,6 +3366,7 @@ def process_decompressed_payload(dec_path: str, client_ip: str, client_key: str,
                 "checksum": ((init_meta or {}).get("checksum") or body.get("checksum")),
                 "delta_norm": delta_norm, "rank": rank, "loss": loss_float,
                 "localSteps": local_steps, "tokensProcessed": _bounded_tokens(body, client_key, local_steps),
+                **({"optimizerSteps": opt_steps, "accum": accum_steps} if opt_steps > 0 else {}),
                 "normalized": False, "submittedAt": int(time.time() * 1000), "weightFormat": "bf16",
                 "shardId": shard_id_for_meta, "taskId": task_id, "crossCheckUsed": cc_used,
                 "actualSeed": cc_actual_seed, "actualSteps": cc_actual_steps,
@@ -2941,7 +3442,8 @@ def process_decompressed_payload(dec_path: str, client_ip: str, client_key: str,
                     return _duplicate_response("already_submitted")
                 _count_submission(client_key, client_ip, task_id)
                 pool["deltas"][client_key] = final_delta_path
-                _persist_submission(pool, client_key, final_delta_path, delta_metadata)
+                _persist_submission(pool, client_key, final_delta_path, delta_metadata,
+                                    user_uuid=((get_current_user(request) or {}).get("uuid")))
                 submitted_path = final_delta_path
                 final_delta_path = None
                 client_pool_map.pop(client_key, None)
@@ -3084,6 +3586,7 @@ def _log_cross_check_summary():
     if not CROSS_CHECK["ENABLED"]: log.info(f"🔍 Cross-check: DISABLED"); return
     log.info(f"🔍 Cross-check: ENABLED — pool={MATCHMAKING['POOL_SIZE']} (MANDATORY)")
     log.info(f"   → targetBatchSize={CROSS_CHECK['TARGET_BATCH_SIZE']} targetLocalSteps={CROSS_CHECK['TARGET_LOCAL_STEPS']}")
+    log.info(f"   → accum={CROSS_CHECK['TARGET_ACCUM_STEPS']} (mainline), derived steps={_round_ref_steps(CROSS_CHECK.get('TARGET_LOCAL_STEPS')) or 'legacy'}")
     log.info(f"   → targetOptimizer={CROSS_CHECK['TARGET_OPTIMIZER']}")
     log.info(f"   → distance threshold={CROSS_CHECK['DISTANCE_THRESHOLD_RATIO']}x (2% absolute floor)")
     log.info(f"   → ban at {CROSS_CHECK['BAN_THRESHOLD']} subnet strikes")
@@ -3234,11 +3737,25 @@ def apply_round_aggregation(ready_pool_list: List[dict]):
     wd = FL_CONFIG["WEIGHT_DECAY"]
     cap = FL_CONFIG["MAX_DELTA_APPLY_NORM"]
     mxn = FL_CONFIG["MAX_WEIGHT_NORM"]
+    n_ref = _round_ref_steps(CROSS_CHECK.get("TARGET_LOCAL_STEPS"))
     step_before = global_step
     n_pools = len(ready_pool_list)
-    pool_norm = 1.0 / n_pools if n_pools > 0 else 1.0
+    # A3: weight pools by the tokens their merged delta represents instead of 1/n_pools.
+    # Unknown counts count as one average pool so a pool is never silently dropped.
+    raw_tokens = [_pool_token_count(pr) for pr in ready_pool_list]
+    if sum(raw_tokens) > 0:
+        known = [t for t in raw_tokens if t > 0]
+        fill = max(1, int(sum(known) / len(known)))
+        w = [t if t > 0 else fill for t in raw_tokens]
+        tot = float(sum(w))
+        pool_w = [x / tot for x in w]
+    else:
+        pool_w = [1.0 / n_pools] * n_pools if n_pools else []
+    if len(pool_w) != n_pools:            # never silently drop a pool
+        pool_w = [1.0 / n_pools] * n_pools if n_pools else []
     log.info(f"🧮 Merging {n_pools} pool result(s) "
-             f"(lr={lr:.4f}, pool_norm={pool_norm:.4f}, wd={wd}, delta_cap={cap}, max_norm={mxn})")
+             f"(lr={lr:.4f}, pool_w={[round(x, 4) for x in pool_w]}, wd={wd}, "
+             f"delta_cap={cap}, max_norm={mxn}, targetOptSteps={n_ref or 'legacy'})")
     if not _mem_guard(1.5, "pool aggregation"):
         log.error("❌ Skipping aggregation — memory pressure. Round advances WITHOUT model update.")
         for pool_result in ready_pool_list:
@@ -3257,8 +3774,21 @@ def apply_round_aggregation(ready_pool_list: List[dict]):
     engram_accumulator = {}
     row_lim = HARDEN["ENGRAM_ROW_NORM_MAX"]
     total_applied = 0; total_tokens = 0; clipped_count = 0; rejected_count = 0
-    for pool_result in ready_pool_list:
+    step_scaled = 0; legacy_steps = 0; step_scales = []; pool_n_refs = []
+    for pool_result, pw in zip(ready_pool_list, pool_w):
         pool_id = pool_result["pool_id"]
+        # A3's reference is the step count *this pool's round* asked for: the round budget is
+        # hardware-scaled, so one global number would rescale a homogeneous pool on a bigger
+        # card (63 steps -> clamp(16/63) = 0.5) and silently halve its delta.  Pools that do not
+        # declare a budget fall back to the count their survivors agree on, then to the global
+        # nominal value.
+        _ptarget = pool_result.get("target_steps")
+        if _ptarget:
+            pool_n_ref = _round_ref_steps(_ptarget) or n_ref
+        else:
+            _pstats = _pool_delta_stats(pool_result.get("deltas", []))
+            pool_n_ref = int(_pstats.get("optimizerSteps") or 0) or n_ref
+        pool_n_refs.append(pool_n_ref)
         for path, weight in pool_result["deltas"]:
             try:
                 md = _delta_metadata(path)
@@ -3298,10 +3828,22 @@ def apply_round_aggregation(ready_pool_list: List[dict]):
                     except Exception: pass
                     continue
                 scale = (cap / dnorm) if (dnorm > cap > 0) else 1.0
-                if scale < 1.0: clipped_count += 1
+                if scale < 1.0:
+                    clipped_count += 1
+                    log.warning(f"⚠️ Delta cap tripped for {path}: ‖δ‖={dnorm:.1f} > cap={cap:.1f}; scaled by {scale:.4f}")
+                # A3: normalise by the number of optimizer steps the delta actually took, so a
+                # volunteer that ran fewer/more steps than the round target contributes the
+                # right *rate*, not the right *distance*.  Legacy deltas are applied as-is.
+                if _delta_opt_steps(md) is None:
+                    step_scale = 1.0
+                    legacy_steps += 1
+                else:
+                    step_scale = _step_scale(pool_n_ref, md)
+                    if step_scale != 1.0: step_scaled += 1
+                step_scales.append(round(step_scale, 4))
+                eff = pw * weight * step_scale * scale
                 if weight > 0:
-                    # was: stream_add_base_delta(global_weights, df, lr * weight * scale)
-                    with shard_lock: stream_add_base_delta(global_weights, df, lr * pool_norm * weight * scale)
+                    with shard_lock: stream_add_base_delta(global_weights, df, lr * eff)
                     eng_idx, eng_val = read_engram_tail(df, MODEL_CONFIG["dim"])
                     if eng_idx is not None and len(eng_idx) > 0:
                         evf = eng_val.float()
@@ -3312,9 +3854,12 @@ def apply_round_aggregation(ready_pool_list: List[dict]):
                         for idx, val, okk in zip(eng_idx.tolist(), evf, ok.tolist()):
                             if not okk or not (0 <= idx < ENG_NUM_BUCKETS): continue
                             if idx not in engram_accumulator:
-                                engram_accumulator[idx] = [torch.zeros(MODEL_CONFIG["dim"], dtype=torch.float32), 0.0]
-                            engram_accumulator[idx][0] += val * weight * scale
-                            engram_accumulator[idx][1] += weight
+                                # [weighted sum, raw weight (trust ramp), effective weight (average)]
+                                engram_accumulator[idx] = [torch.zeros(MODEL_CONFIG["dim"], dtype=torch.float32), 0.0, 0.0]
+                            acc = engram_accumulator[idx]
+                            acc[0] += val * eff
+                            acc[1] += weight
+                            acc[2] += eff
                 total_applied += 1
                 total_tokens += df.tokens
             except Exception as e:
@@ -3351,18 +3896,22 @@ def apply_round_aggregation(ready_pool_list: List[dict]):
         if engram_accumulator:
             log.info(f"🧠 Updating {len(engram_accumulator)} engram buckets")
             ftw = HARDEN["ENGRAM_FULL_TRUST_WEIGHT"]
-            for idx, (vs, ws) in engram_accumulator.items():
-                if ws > 0:
+            for idx, (vs, ws, weff) in engram_accumulator.items():
+                if weff > 0:
                     trust = min(1.0, ws / ftw) if ftw > 0 else 1.0
-                    avg = vs / ws
+                    avg = vs / weff
                     sp = idx * MODEL_CONFIG["dim"]; ep = sp + MODEL_CONFIG["dim"]
-                    global_engram_weights[sp:ep] += avg * (lr * pool_norm * trust)   # ← add pool_norm
+                    global_engram_weights[sp:ep] += avg * (lr * trust)   # pool_w/step_scale/trust folded into avg
             del engram_accumulator
             gc.collect()
         with stats_lock: global_step += 1
-    PUB.event("aggregation", step=global_step, pools=n_pools, applied=total_applied, rejected=rejected_count, clipped=clipped_count, tokens=total_tokens, norm=norm, lr=lr)
+    PUB.event("aggregation", step=global_step, pools=n_pools, applied=total_applied, rejected=rejected_count, clipped=clipped_count, tokens=total_tokens, norm=norm, lr=lr,
+              poolWeights=[round(x, 4) for x in pool_w], stepScales=sorted(set(step_scales)),
+              poolNRefs=pool_n_refs,
+              stepScaled=step_scaled, legacySteps=legacy_steps, maxDeltaApplyNorm=cap)
     log.info(f"✅ SGD step {global_step}: applied {total_applied}, rejected {rejected_count}, "
-             f"tokens={total_tokens:,}, norm={norm:.2f}, lr={lr:.4f}, clipped={clipped_count}/{total_applied}")
+             f"tokens={total_tokens:,}, norm={norm:.2f}, lr={lr:.4f}, clipped={clipped_count}/{total_applied}, "
+             f"step_scaled={step_scaled}, legacy_steps={legacy_steps}")
     if HARDEN["LOSS_CHECK_MODE"] == "off": handle_checkpoints()
     gc.collect()
 
@@ -3386,6 +3935,106 @@ async def _measure_control_plane(request: Request, call_next):
         except ValueError: pass
         CONTROL_PLANE["round"] = round_state["current_round"]
     return response
+
+@app.middleware("http")
+async def _stamp_country_middleware(request: Request, call_next):
+    stamp_client_country(request)
+    response = await call_next(request)
+    stamp_client_country(request)
+    return response
+
+@app.get("/api/geo")
+async def api_geo(mode: str = "active"):
+    """
+    mode=active      → clients seen within IP_TIMEOUT_S  (live)
+    mode=round       → clients participating in current round
+    mode=registered  → all client_hardware entries with a country (in-memory)
+    mode=all_time    → every client ever seen, dedup'd per user (persisted)
+    """
+    if mode not in ("active", "round", "registered", "all_time"):
+        mode = "active"
+    now = time.time()
+    alpha_counts: Dict[str, int] = {}
+
+    if mode == "all_time":
+        with user_countries_lock:
+            for entry in user_countries.values():
+                cc = entry.get("country")
+                if cc:
+                    alpha_counts[cc] = alpha_counts.get(cc, 0) + 1
+    else:
+        if mode == "active":
+            keys = [ck for ck, ts in list(active_clients.items())
+                    if now - ts <= FL_CONFIG["IP_TIMEOUT_S"]]
+        elif mode == "round":
+            keys = list(round_state.get("participating_clients", {}).keys())
+        else:  # registered
+            keys = list(client_hardware.keys())
+        for ck in keys:
+            cc = (client_hardware.get(ck) or {}).get("country")
+            if cc:
+                alpha_counts[cc] = alpha_counts.get(cc, 0) + 1
+
+    numeric_counts: Dict[str, int] = {}
+    for cc, n in alpha_counts.items():
+        num = _alpha2_to_numeric(cc)
+        if num:
+            numeric_counts[num] = numeric_counts.get(num, 0) + n
+
+    return {
+        "mode": mode,
+        "window_s": FL_CONFIG["IP_TIMEOUT_S"] if mode == "active" else None,
+        "total": sum(alpha_counts.values()),
+        "by_alpha2":  dict(sorted(alpha_counts.items(),  key=lambda kv: (-kv[1], kv[0]))),
+        "by_numeric": dict(sorted(numeric_counts.items(), key=lambda kv: (-kv[1], kv[0]))),
+        "generatedAt": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@app.get("/api/admin/geo_debug")
+async def admin_geo_debug(request: Request, secret: str = ""):
+    """One-shot diagnostic: tells you exactly what the server sees."""
+    if not _admin_ok(secret): raise HTTPException(403, "Invalid secret")
+    now = time.time()
+    peer = request.client.host if request.client else "?"
+    return {
+        "backend": _GEOIP_BACKEND or "disabled",
+        "self": {
+            "peer_ip":          peer,
+            "is_trusted":       _peer_in_trusted(request),
+            "trusted_nets":     [str(n) for n in HARDEN["TRUSTED_PROXY_NETS"]],
+            "cf_ipcountry":     request.headers.get("cf-ipcountry"),
+            "cf_connecting":    request.headers.get("cf-connecting-ip"),
+            "resolved_ip":      get_client_ip(request),
+            "resolved_country": get_client_country(request),
+        },
+        "counts": {
+            "active_clients":           len(active_clients),
+            "client_hardware":          len(client_hardware),
+            "hardware_with_country":    sum(1 for hw in client_hardware.values() if hw.get("country")),
+            "user_countries_persisted": len(user_countries),
+        },
+        "sample_hardware": [
+            {"ck": ck[:40], "country": hw.get("country"),
+             "age_s": int(now - hw.get("last_seen", now))}
+            for ck, hw in list(client_hardware.items())[:10]
+        ],
+    }
+
+
+@app.post("/api/admin/test_country")
+async def admin_test_country(secret: str = "", client_key: str = "", country: str = ""):
+    """Inject a fake country for a fake client — proves the map works."""
+    if not _admin_ok(secret): raise HTTPException(403, "Invalid secret")
+    cc = (country or "").upper()
+    if len(cc) != 2: raise HTTPException(400, "country must be 2 letters")
+    if not client_key: raise HTTPException(400, "client_key required")
+    hw = client_hardware.setdefault(client_key, {})
+    hw["country"] = cc
+    hw["last_seen"] = time.time()
+    active_clients[client_key] = time.time()
+    _record_user_country(client_key, cc, "0.0.0.0")
+    return {"ok": True, "client_key": client_key, "country": cc}
 
 app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_credentials=True,
@@ -3457,6 +4106,7 @@ async def get_task(request: Request, format: str = "bf16", skip_weights: bool = 
     if _gate is not None: return _gate
     client_ip = get_client_ip(request)
     client_key = get_client_key(request)
+    _capture_client_key(client_key, request)
     active_clients[client_key] = time.time()
     client_hardware[client_key] = {
         "backend":  (request.headers.get("X-Client-Backend")    or "").upper(),
@@ -3565,6 +4215,7 @@ async def submit_delta(request: Request):
         raise HTTPException(status_code=503, detail="Server aggregating", headers={"Retry-After": "120"})
     client_ip = get_client_ip(request)
     client_key = get_client_key(request)
+    _capture_client_key(client_key, request)
     active_clients[client_key] = time.time()
     _check_upload_capacity()
     temp_compressed = None
@@ -3598,6 +4249,7 @@ async def submit_init(request: Request):
         raise HTTPException(status_code=503, detail="Server aggregating", headers={"Retry-After": "120"})
     client_ip = get_client_ip(request)
     client_key = get_client_key(request)
+    _capture_client_key(client_key, request)
     active_clients[client_key] = time.time()
     _check_upload_capacity()
     try: data = await request.json()
@@ -3645,13 +4297,17 @@ async def submit_init(request: Request):
         "checksum": checksum, "weightFormat": fmt, "hasEngram": has_engram,
         "engramSparseCount": engram_sparse_count, "loss": data.get("loss"),
         "localSteps": data.get("localSteps"), "tokensProcessed": data.get("tokensProcessed"),
+        "optimizerSteps": data.get("optimizerSteps"), "accum": data.get("accum"),
         "loraRank": data.get("loraRank"), "isDelta": data.get("isDelta", True),
         "crossCheckUsed": data.get("crossCheckUsed", False),
         "actualSeed": data.get("actualSeed"), "actualSteps": data.get("actualSteps"),
         "actualBatchSize": data.get("actualBatchSize"),
         "actualOptimizer": data.get("actualOptimizer"),
         "ticketId": data.get("ticketId"),
-        "checksum": checksum}
+        "checksum": checksum,
+        "receipt": data.get("receipt"),
+        "receiptSig": data.get("receiptSig"),
+        "clientPubkey": data.get("clientPubkey") or request.headers.get("X-Client-Pubkey")}
     with uploads_lock:
         _active_uploads[upload_id] = {"dir": up_dir, "created": time.time(), "last_activity": time.time(),
             "status": "open", "client_key": client_key, "client_ip": client_ip,
@@ -3711,7 +4367,25 @@ async def submit_chunk(request: Request, uploadId: str, index: int):
         expected_sha = request.headers.get("X-Chunk-Sha256")
         if expected_sha and expected_sha.lower() != h.hexdigest():
             raise HTTPException(400, "Checksum mismatch")
-        os.replace(part_tmp, part_final)
+        try:
+            os.replace(part_tmp, part_final)
+        except FileNotFoundError:
+            # Concurrent retry for the same (uploadId, index) already won the race
+            # and renamed the file. If the resulting .bin looks right, treat this
+            # request as a successful duplicate instead of a 500.
+            if not (part_final.exists() and part_final.stat().st_size == size):
+                raise
+            with uploads_lock:
+                up = _active_uploads.get(uploadId)
+                if up:
+                    old = up["chunk_sizes"].get(index, 0)
+                    up["chunk_sizes"][index] = size
+                    up["bytes_received"] = up["bytes_received"] - old + size
+                    up["received"].add(index)
+                    up["last_activity"] = time.time()
+            return {"ok": True, "index": index, "size": size, "duplicate": True,
+                    "receivedChunks": len(up["received"]) if up else 0,
+                    "totalChunks": up["chunks"] if up else 0}
         with uploads_lock:
             up = _active_uploads.get(uploadId)
             if not up: raise HTTPException(404, "Unknown uploadId")
@@ -3842,7 +4516,7 @@ async def submit_finalize(request: Request):
 @app.post("/auth/register")
 async def register(request: Request):
     client_ip = get_client_ip(request)
-    if not _rate_limit_auth(client_ip, _register_attempts, 3, 3600):
+    if not _rate_limit_auth(client_ip, _register_attempts, 100, 3600):
         log.warning(f"🚫 Rate-limited registration from {client_ip}")
         raise HTTPException(429, "Too many registrations from this IP; try again later")
     try: data = await request.json()
@@ -3900,6 +4574,64 @@ async def auth_me(request: Request):
             "globalRank": compute_global_rank(user["uuid"])}
 
 # ============ ADMIN ROUTES ============
+@app.get("/audit")
+async def audit_page():
+    return HTMLResponse("""<!doctype html><html><head><meta charset="utf-8">
+<title>CrowdGPT audit</title><style>body{font:14px system-ui;max-width:1100px;margin:2rem auto}
+table{border-collapse:collapse;width:100%}td,th{border-bottom:1px solid #ddd;padding:.35rem;text-align:left}
+code{font-size:12px}</style></head><body>
+<h1>CrowdGPT audit</h1><p>Append-only signed round records. Reported, checked and held-out values are never merged.</p>
+<p id="chain"></p><table><thead><tr><th>round</th><th>leader</th><th>record hash</th><th>weights</th><th>bytes</th></tr></thead>
+<tbody id="rows"></tbody></table>
+<script>
+async function main(){
+ const r=await fetch('/api/audit/rounds').then(x=>x.json());
+ const c=await fetch('/api/audit/chain').then(x=>x.json());
+ document.getElementById('chain').textContent=`chain ok=${c.ok} rounds=${c.rounds} broken=${JSON.stringify(c.broken)}`;
+ const tb=document.getElementById('rows');
+ for(const item of r.rounds){
+  const rec=item.record, tr=document.createElement('tr');
+  tr.innerHTML=`<td>${rec.round}</td><td><code>${rec.leader}</code></td>`+
+   `<td><code>${(rec.certificate&&rec.certificate[0]?rec.certificate[0].sig:'').slice(0,16)}…</code></td>`+
+   `<td><code>${rec.aggregate_weights.slice(0,16)}…</code></td>`+
+   `<td>${rec.bytes.down}/${rec.bytes.up}</td>`;
+  tb.appendChild(tr);
+ }
+}
+main();
+</script></body></html>""", media_type="text/html")
+
+@app.get("/api/audit/rounds")
+async def audit_rounds():
+    if ORCH is None: return {"rounds": []}
+    return {"rounds": ORCH.audit.rounds()}
+
+@app.get("/api/audit/checkpoint")
+async def audit_checkpoint(upto: int | None = None):
+    if ORCH is None: raise HTTPException(404, "Orchestrator state disabled")
+    return ORCH.audit.checkpoint(upto)
+
+@app.get("/api/audit/proof")
+async def audit_proof(round: int):
+    if ORCH is None: raise HTTPException(404, "Orchestrator state disabled")
+    try: return ORCH.audit.inclusion(round)
+    except KeyError: raise HTTPException(404, f"round {round} not published")
+
+@app.get("/api/audit/chain")
+async def audit_chain():
+    if ORCH is None: return {"rounds": 0, "broken": [], "ok": True}
+    return ORCH.audit.verify_chain()
+
+@app.get("/api/node")
+async def get_node():
+    if ORCH is None: raise HTTPException(404, "Orchestrator state disabled")
+    nodes = NodeRegistry(ORCH.store).active()
+    return {"nodes": [n.record for n in nodes]}
+
+@app.get("/api/nodes")
+async def get_nodes():
+    return await get_node()
+
 @app.get("/api/checkpoints")
 async def list_checkpoints(secret: str = ""):
     if not _admin_ok(secret): raise HTTPException(403, "Invalid secret")
@@ -4153,6 +4885,72 @@ def _delta_metadata(path: str) -> Optional[dict]:
             return json.loads(f.read(n))
     except Exception: return None
 
+REF_MICRO_BATCH_TOKENS = 4096     # bs=2 x sl=2048: the nominal client micro-batch
+
+def _round_ref_steps(local_steps=None) -> int:
+    """Optimizer steps a round of `local_steps` chunks contains (A3's `n_ref`).
+
+    Derived from mainline's own accumulation target: `ceil(chunks / TARGET_ACCUM_STEPS)`,
+    i.e. 16 steps for a 500-chunk round and 63 for a 2000-chunk round.  0 when unknown.
+    """
+    try: local = int(local_steps or 0)
+    except (TypeError, ValueError): local = 0
+    try: accum = max(1, int(CROSS_CHECK.get("TARGET_ACCUM_STEPS") or 32))
+    except (TypeError, ValueError): accum = 32
+    return max(1, int(math.ceil(local / accum))) if local > 0 else 0
+
+def _delta_opt_steps(md: Optional[dict]) -> Optional[int]:
+    """Optimizer steps a delta actually took, or None for a legacy client (field absent).
+
+    None is deliberately not 1: a legacy delta carries ~15 optimizer steps, and scaling it
+    by n_ref/1 would double its magnitude instead of leaving it alone.
+    """
+    if not md: return None
+    raw = md.get("optimizerSteps")
+    if raw is None: return None
+    try: n = int(raw)
+    except (TypeError, ValueError): return None
+    return n if n > 0 else None
+
+def _step_scale(n_ref: int, md: Optional[dict]) -> float:
+    """A3: target optimizer steps / delta optimizer steps, clamped to [0.5, 2.0].
+
+    The clamp keeps bad or hostile metadata from inverting or blowing up a delta; legacy
+    deltas (no `optimizerSteps`) are applied unscaled.
+    """
+    if n_ref <= 0: return 1.0
+    n = _delta_opt_steps(md)
+    if n is None: return 1.0
+    return min(2.0, max(0.5, float(n_ref) / float(n)))
+
+def _pool_delta_stats(survivors: list) -> dict:
+    """Token count and agreed optimizer-step count of one pool's survivors (A3 metadata)."""
+    tokens = 0; steps = []
+    for path, _w in survivors:
+        md = _delta_metadata(path) or {}
+        try: tokens += max(0, int(md.get("tokensProcessed") or md.get("tokens") or 0))
+        except (TypeError, ValueError): pass
+        n = _delta_opt_steps(md)
+        if n is not None: steps.append(n)
+    agreed = None
+    if steps:
+        agreed = max(set(steps), key=steps.count)
+        if len(set(steps)) > 1:
+            log.warning(f"⚠️ pool members disagree on optimizerSteps={sorted(set(steps))}; using {agreed}")
+    return {"tokens": tokens, "optimizerSteps": agreed}
+
+def _pool_token_count(pool_result: dict) -> int:
+    """Tokens a ready pool entry represents; 0 when the metadata is absent."""
+    try: t = int(pool_result.get("tokens") or 0)
+    except (TypeError, ValueError): t = 0
+    if t > 0: return t
+    total = 0
+    for path, _w in pool_result.get("deltas", []):
+        md = _delta_metadata(path) or {}
+        try: total += max(0, int(md.get("tokensProcessed") or md.get("tokens") or 0))
+        except (TypeError, ValueError): pass
+    return total
+
 def _find_user_uuid(user_id: str = "", username: str = "") -> Optional[str]:
     if user_id and user_id in users_db["users"]: return user_id
     if username:
@@ -4298,26 +5096,13 @@ async def get_stats(request: Request):
             "formingPools": sum(1 for p in pools.values() if p["status"] == "forming"),
             "trainingPools": sum(1 for p in pools.values() if p["status"] == "training"),
             "readyPools": len(ready_pools)}
-        # Pool hardware breakdown
-        pool_breakdown = {}
-        for pool in pools.values():
-            sig = pool.get("hardware_sig", ())
-            if len(sig) < 5: continue
-            backend = sig[0]
-            autocast = sig[2]
-            gpu_arch = sig[4]
-            key = f"{backend}-{autocast}-{gpu_arch}"
-            if key not in pool_breakdown:
-                pool_breakdown[key] = {"forming": 0, "training": 0, "ready": 0, "clients": 0}
-            pool_breakdown[key][pool["status"]] += 1
-            pool_breakdown[key]["clients"] += len(pool.get("clients", []))
-        mm["poolBreakdown"] = pool_breakdown
+        mm["poolBreakdown"] = _pool_hardware_breakdown(pools.values())
     return {"totalParticipants": total_users, "totalContributions": lora_stats.get("total_submissions", 0),
         "activeGpus": active_gpus, "totalTokens": global_stats["totalTokens"],
         "trainingLossChange": training_loss_change, "yourContribution": your_contribution,
         "activeNow": active_gpus, "totalSteps": global_stats["totalSteps"], "globalStep": global_step,
         "modelSize": MODEL_SIZE, "lastLoss": global_stats["lastLoss"], "avgLoss": avg_loss,
-        "weightNorm": float(torch.norm(global_weights.float()).item()) if global_weights is not None else 0.0,
+        "weightNorm": flat_norm(global_weights) if global_weights is not None else 0.0,
         "loraStats": lora_stats, "totalUsers": total_users, "activeContributors": active_gpus,
         "lossHistory": global_stats["lossHistory"][-20:],
         "datasetStats": {"totalChunks": dataset_info["totalChunks"], "currentChunk": data_position["currentChunkIdx"],
@@ -4356,6 +5141,55 @@ async def api_loss_history(rounds: int = 2000, pools: int = 2000):
         p = list(PUB.pools)[-max(1, min(pools, 2000)):]
     return {"rounds": r, "pools": p, "note": "loss = token-weighted client-reported training loss of cross-checked deltas; "
             "heldoutLoss (when present) is the server-side evaluator's loss"}
+
+@app.get("/api/proposals")
+async def list_proposals(limit: int = 100):
+    if ORCH is None: return {"proposals": []}
+    return {"proposals": ORCH.proposals.list(limit)}
+
+@app.post("/api/proposals")
+async def create_proposal(request: Request):
+    if ORCH is None: raise HTTPException(404, "Orchestrator state disabled")
+    body = await request.json()
+    actor = (get_current_user(request) or {}).get("uuid") or get_client_key(request)
+    try:
+        return ORCH.proposals.create(body.get("title", ""), body.get("body", ""), actor)
+    except ValueError as exc:
+        raise HTTPException(400, {"reason": str(exc)})
+
+@app.post("/api/proposals/{proposal_id}/vote")
+async def vote_proposal(proposal_id: str, request: Request):
+    if ORCH is None: raise HTTPException(404, "Orchestrator state disabled")
+    actor = (get_current_user(request) or {}).get("uuid") or get_client_key(request)
+    try:
+        return ORCH.proposals.vote_with_ledger(proposal_id, actor)
+    except KeyError:
+        raise HTTPException(404, {"reason": "proposal_not_found"})
+    except PermissionError as exc:
+        raise HTTPException(403, {"reason": str(exc)})
+
+@app.get("/api/leaderboard/verified")
+async def get_verified_leaderboard(limit: int = 100):
+    if ORCH is None:
+        return {"source": "verified", "entries": [],
+                "totals": {"actors": 0, "tokens": 0, "submissions": 0}}
+    return ORCH.leaderboard.verified(limit)
+
+@app.get("/api/leaderboard/reported")
+async def get_reported_leaderboard():
+    with users_lock:
+        entries = [{"uuid": u["uuid"], "username": u["username"],
+                    "contributions": u["stats"].get("contributions", 0),
+                    "totalTokens": u["stats"].get("totalTokens", 0),
+                    "totalSteps": u["stats"].get("totalSteps", 0),
+                    "trustScore": compute_trust_score(u["stats"]),
+                    "byzantineFlags": u["stats"].get("byzantine_flags", 0),
+                    "power": bool(u.get("power", False))}
+                   for u in users_db["users"].values()]
+    entries.sort(key=lambda x: x["totalTokens"], reverse=True)
+    if ORCH is None:
+        return {"source": "reported", "entries": entries}
+    return ORCH.leaderboard.legacy(entries)
 
 @app.get("/api/leaderboard")
 async def get_leaderboard():
@@ -4477,7 +5311,7 @@ async def admin_restore_from_hf(secret: str = "", revision: str = "", step: int 
     pushed = upload_to_huggingface()
     try: update_and_save_status(push_hf=True)
     except Exception as e: log.error(f"status: {e}")
-    wte_norm = float(global_weights[:MODEL_CONFIG["vocabSize"] * MODEL_CONFIG["dim"]].float().norm().item())
+    wte_norm = flat_norm(global_weights[:MODEL_CONFIG["vocabSize"] * MODEL_CONFIG["dim"]])
     return {"status": "restored", "revision": revision, "step": step, "hf_step": hf_step,
         "model_size": MODEL_SIZE, "wte_norm": wte_norm, "pushed_to_hf": pushed}
 
@@ -4486,6 +5320,7 @@ async def admin_restore_from_hf(secret: str = "", revision: str = "", step: int 
 async def startup():
     load_dataset_state(); load_users_db(); load_global_state(); _load_loss_state()
     initialize_model(); load_model_weights(); load_engram_weights()
+    _load_user_countries() 
     initialize_dataset(); _ensure_permutation(); _crash_recovery()
     restored = _restore_orchestrator_state()
     if not restored:

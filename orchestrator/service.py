@@ -5,11 +5,16 @@ from pathlib import Path
 from typing import Optional
 
 from .admission import AdmissionService
+from .audit import AuditService
 from .identity import NodeIdentity
+from .leaderboard import LeaderboardService
+from .proposals import ProposalService
 from .publication import PublicationService
+from .receipts import ReceiptService
 from .scheduling import SchedulingService
 from .state import StateStore
 from .submission import SubmissionService
+from .validation import ValidationService
 from .verification import VerificationService
 
 
@@ -23,7 +28,12 @@ class Orchestrator:
         self.scheduling = SchedulingService(store)
         self.submission = SubmissionService(store)
         self.verification = VerificationService(store)
+        self.receipts = ReceiptService(store)
         self.publication = PublicationService(store, publication_jsonl)
+        self.audit = AuditService(self.publication)
+        self.leaderboard = LeaderboardService(store)
+        self.proposals = ProposalService(store)
+        self.validation = ValidationService(store)
 
     @classmethod
     def open(cls, path: str | Path, *, publication_jsonl: Optional[str | Path] = None,

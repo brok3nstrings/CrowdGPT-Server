@@ -13,6 +13,27 @@ The client lives in the main repository. For the model and training setup, see [
 5. **Aggregation.** Surviving deltas from all pools are applied to the global model at the end of the round (4 h at most). Submissions outside a pool go through Krum instead.
 6. **Publish.** The new checkpoint is pushed to Hugging Face, where clients download it for the next round.
 
+### How the aggregate is applied
+
+A round must be a *descent step*, not a consensus of endpoints. Three rules produce that
+(see `approach-fix/PLAN.md` in the audit sidecar):
+
+- **Same batch as v1: `accum = 32`.** `CROWDGPT_TARGET_ACCUM_STEPS` is sent to clients and they
+  use it verbatim, so the inner batch is 32 micro-batches (131 072 tokens) on every card, exactly
+  as v1 did. Rounds are longer on bigger cards (`500 × VRAM/8` chunks, capped at 2500), so a
+  2000-chunk round simply contains 63 updates instead of 16. Measured alternative: pinning the
+  step count instead (e.g. 32 updates where the round allows 16) gave −0.038 BPB on an 8 GB card
+  but degrades once the round is long enough that the batch has to grow to reach the pin.
+- **Normalise a delta by the steps it took, against *its own pool's* round.** Clients report
+  `optimizerSteps` and `accum`; the server scales each delta by `clamp(n_ref / steps, 0.5, 2.0)`
+  with `n_ref = ceil(target_steps / accum)` for that pool (falling back to the count its survivors
+  agree on). One global reference would rescale an entire healthy pool on a big card — a 2000-chunk
+  round runs 63 steps, and `clamp(16/63) = 0.5` would halve its delta every round. Legacy deltas
+  without `optimizerSteps` are applied unscaled.
+
+`MAX_DELTA_APPLY_NORM` (default `12000`) is a tripwire: a delta above it is clipped and a
+warning is logged. It is not a routine nonlinearity.
+
 ## Requirements
 
 - Python 3 and a machine with enough disk for checkpoints and pending deltas. The server refuses new tasks below 10 GB free and new uploads below 2 GB.
@@ -21,7 +42,7 @@ The client lives in the main repository. For the model and training setup, see [
 ## Running
 
 ```bash
-pip install fastapi uvicorn torch numpy requests slowapi huggingface_hub safetensors psutil
+pip install -r requirements.txt
 
 export CROWDGPT_ADMIN_SECRET="$(openssl rand -hex 32)"
 export HF_TOKEN="hf_..."        # without it, Hugging Face uploads are disabled
@@ -29,7 +50,16 @@ export HF_TOKEN="hf_..."        # without it, Hugging Face uploads are disabled
 python server.py                 # listens on 0.0.0.0:5006
 ```
 
-Logs go to stdout and to `server.log` (rotated at 50 MB, 5 files).
+Or run it in a container:
+
+```bash
+cp .env.example .env            # set CROWDGPT_ADMIN_SECRET and CROWDGPT_PUBLIC_URL
+docker compose up -d --build
+```
+
+See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for systemd, persistence and reverse-proxy notes.
+
+Logs go to stdout and to `server.log` (rotated at 50 MB, 5 files). Under Docker, configure rotation on the JSON log driver.
 
 If the server sits behind a reverse proxy or tunnel, set `CROWDGPT_TRUSTED_PROXIES` to the proxy's address range. Otherwise every client appears to come from the proxy, which breaks per-IP limits and bans.
 
@@ -46,9 +76,11 @@ All settings are environment variables. Defaults are the values used when the va
 | `CROWDGPT_FORMING_TIMEOUT_S` | `1800` | How long a pool waits to fill |
 | `CROWDGPT_TIER0` / `TIER1` / `TIER2` | `1` | Matching levels: backend + precision + optimizer / backend + precision / backend only |
 | `CROWDGPT_TARGET_BATCH_SIZE` | `2` | Batch size given to pool members |
-| `CROWDGPT_TARGET_ACCUM_STEPS` | `32` | Gradient accumulation steps |
-| `CROWDGPT_TARGET_LOCAL_STEPS` | `500` | Micro-steps per task |
+| `CROWDGPT_TARGET_ACCUM_STEPS` | `32` | Gradient accumulation steps; sent to clients as `0` whenever a step or token budget is live, so the client derives it |
+| `CROWDGPT_TARGET_LOCAL_STEPS` | `500` | Micro-steps per task (base for the `VRAM/8` hardware factor) |
 | `CROWDGPT_TARGET_AUTOCAST` | `any` | Force a precision for pools (`bf16`, `fp32`, `any`) |
+| `CROWDGPT_INIT_MODE` | `ln_identity` | Fresh-run init: `ln_identity` = N(0,0.02) + LayerNorm 1/0 (`‖W‖ ≈ 581.7`), `flat` = N(0,0.02) for every parameter, LayerNorm included (`‖W‖ ≈ 512.9`, what v1 ran with) |
+| `CROWDGPT_MAX_DELTA_APPLY_NORM` | `12000` | Per-delta clip at aggregation time. A tripwire that logs a warning, not a normaliser |
 | `CROWDGPT_MAX_CHECKPOINTS` | `5` | Local checkpoints to keep |
 
 **Verification**
